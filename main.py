@@ -4,7 +4,7 @@ import re
 import sys
 import time
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 from urllib.request import Request, urlopen
 
 import pandas as pd
@@ -205,9 +205,13 @@ def resolve_partition_root(raw_path: str) -> Path:
     return partition_root
 
 
-def write_partitioned_json(records: List[Dict[str, object]], partition_root: Path) -> int:
+def write_partitioned_json(
+    records: List[Dict[str, object]],
+    partition_root: Path,
+    existing_files: Optional[Set[str]] = None,
+) -> int:
     written = 0
-    existing: set[str] = set()
+    session_existing: set[str] = set()
     for record in records:
         product_type, product_name = derive_product(record)
         item = dict(record)
@@ -218,14 +222,18 @@ def write_partitioned_json(records: List[Dict[str, object]], partition_root: Pat
             product_name,
             item.get("title", ""),
             item.get("article_id", ""),
-            existing,
+            session_existing,
         )
+        if existing_files is not None and filename in existing_files:
+            continue
         output_path = partition_root / filename
         frame = pd.DataFrame([item])
         data = frame.to_dict(orient="records")[0]
         with output_path.open("w", encoding="utf-8") as handle:
             json.dump(data, handle, ensure_ascii=False, indent=2)
-        existing.add(filename)
+        session_existing.add(filename)
+        if existing_files is not None:
+            existing_files.add(filename)
         written += 1
     return written
 
@@ -233,36 +241,53 @@ def write_partitioned_json(records: List[Dict[str, object]], partition_root: Pat
 def main() -> int:
     args = parse_args()
     partition_root = resolve_partition_root(args.output)
+    existing_files: Set[str] = {path.name for path in partition_root.glob("*.json")}
 
-    collected: List[Dict[str, object]] = []
+    batch: List[Dict[str, object]] = []
+    total_collected = 0
+    total_written = 0
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=args.headless)
         page = browser.new_page()
         try:
+            stop = False
             for idx, (article_url, lastmod) in enumerate(iter_article_urls(args.sitemap_index), start=1):
+                if args.limit and total_collected >= args.limit:
+                    break
                 if not is_allowed(article_url):
                     continue
-                if args.limit and len(collected) >= args.limit:
-                    break
                 try:
                     record = scrape_article(page, article_url, args.wait, args.timeout)
                     record["lastmod"] = lastmod
-                    collected.append(record)
-                    print(f"[{len(collected)}] {record['title']}")
+                    batch.append(record)
+                    total_collected += 1
+                    print(f"[{total_collected}] {record['title']}")
+                    if len(batch) >= 10:
+                        total_written += write_partitioned_json(batch, partition_root, existing_files)
+                        batch.clear()
+                    if args.limit and total_collected >= args.limit:
+                        stop = True
                 except PlaywrightTimeoutError as exc:
                     print(f"Timeout loading {article_url}: {exc}", file=sys.stderr)
                 except Exception as exc:  # noqa: BLE001
                     print(f"Failed to process {article_url}: {exc}", file=sys.stderr)
+                if stop:
+                    break
                 time.sleep(args.delay)
         finally:
             browser.close()
 
-    if not collected:
+    if batch:
+        total_written += write_partitioned_json(batch, partition_root, existing_files)
+        batch.clear()
+
+    if not total_collected:
         print("No articles collected", file=sys.stderr)
         return 1
 
-    partition_count = write_partitioned_json(collected, partition_root)
-    print(f"Partitioned {len(collected)} articles into {partition_count} files under {partition_root}")
+    print(
+        f"Partitioned {total_collected} articles into {total_written} files under {partition_root}"
+    )
     return 0
 
 
