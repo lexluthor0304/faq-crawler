@@ -3,6 +3,7 @@ import json
 import re
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 from urllib.request import Request, urlopen
@@ -209,8 +210,8 @@ def write_partitioned_json(
     records: List[Dict[str, object]],
     partition_root: Path,
     existing_files: Optional[Set[str]] = None,
-) -> int:
-    written = 0
+) -> List[Dict[str, object]]:
+    written_records: List[Dict[str, object]] = []
     session_existing: set[str] = set()
     for record in records:
         product_type, product_name = derive_product(record)
@@ -234,39 +235,113 @@ def write_partitioned_json(
         session_existing.add(filename)
         if existing_files is not None:
             existing_files.add(filename)
-        written += 1
-    return written
+        written_records.append(record)
+    return written_records
 
 
 def main() -> int:
     args = parse_args()
     partition_root = resolve_partition_root(args.output)
+    state_path = partition_root / ".crawl_state.json"
+    processed_urls: Set[str] = set()
+    processed_article_ids: Set[str] = set()
+    last_processed_url: Optional[str] = None
+    last_processed_timestamp: Optional[str] = None
+
+    if state_path.exists():
+        try:
+            with state_path.open("r", encoding="utf-8") as handle:
+                state_data = json.load(handle)
+            processed_urls = set(state_data.get("processed_urls", []))
+            processed_article_ids = set(state_data.get("processed_article_ids", []))
+            last_processed_url = state_data.get("last_processed_url")
+            last_processed_timestamp = state_data.get("last_processed_timestamp")
+            state_output = state_data.get("output_dir")
+            if state_output and Path(state_output) != partition_root:
+                print(
+                    f"Loaded state from {state_path} for output {state_output}",
+                    file=sys.stderr,
+                )
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"Failed to load state file {state_path}: {exc}", file=sys.stderr)
+            processed_urls = set()
+            processed_article_ids = set()
+            last_processed_url = None
+            last_processed_timestamp = None
+
     existing_files: Set[str] = {path.name for path in partition_root.glob("*.json")}
 
     batch: List[Dict[str, object]] = []
     total_collected = 0
     total_written = 0
+
+    def flush_batch() -> None:
+        nonlocal total_written, last_processed_url, last_processed_timestamp
+        if not batch:
+            return
+        written_records = write_partitioned_json(batch, partition_root, existing_files)
+        if not written_records:
+            batch.clear()
+            return
+        total_written += len(written_records)
+        now = datetime.now(timezone.utc).isoformat()
+        for record in written_records:
+            url = str(record.get("url") or "")
+            if url:
+                processed_urls.add(url)
+                last_processed_url = url
+            article_id = str(record.get("article_id") or "")
+            if article_id:
+                processed_article_ids.add(article_id)
+            last_processed_timestamp = now
+        state_payload = {
+            "processed_urls": sorted(processed_urls),
+            "processed_article_ids": sorted(processed_article_ids),
+            "last_processed_url": last_processed_url,
+            "last_processed_timestamp": last_processed_timestamp,
+            "output_dir": str(partition_root),
+        }
+        try:
+            with state_path.open("w", encoding="utf-8") as handle:
+                json.dump(state_payload, handle, ensure_ascii=False, indent=2)
+        except OSError as exc:
+            print(f"Failed to write state file {state_path}: {exc}", file=sys.stderr)
+        batch.clear()
+
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=args.headless)
         page = browser.new_page()
         try:
             stop = False
-            for idx, (article_url, lastmod) in enumerate(iter_article_urls(args.sitemap_index), start=1):
-                if args.limit and total_collected >= args.limit:
+            for article_url, lastmod in iter_article_urls(args.sitemap_index):
+                if args.limit and total_written >= args.limit:
                     break
+                if args.limit and batch and total_written + len(batch) >= args.limit:
+                    flush_batch()
+                    if args.limit and total_written >= args.limit:
+                        break
+                if article_url in processed_urls:
+                    continue
                 if not is_allowed(article_url):
                     continue
                 try:
                     record = scrape_article(page, article_url, args.wait, args.timeout)
                     record["lastmod"] = lastmod
+                    article_id = str(record.get("article_id") or "")
+                    if article_url in processed_urls or (
+                        article_id and article_id in processed_article_ids
+                    ):
+                        continue
                     batch.append(record)
                     total_collected += 1
                     print(f"[{total_collected}] {record['title']}")
-                    if len(batch) >= 10:
-                        total_written += write_partitioned_json(batch, partition_root, existing_files)
-                        batch.clear()
-                    if args.limit and total_collected >= args.limit:
-                        stop = True
+                    if args.limit and total_written + len(batch) >= args.limit:
+                        flush_batch()
+                        if args.limit and total_written >= args.limit:
+                            stop = True
+                            break
+                    elif len(batch) >= 10:
+                        flush_batch()
                 except PlaywrightTimeoutError as exc:
                     print(f"Timeout loading {article_url}: {exc}", file=sys.stderr)
                 except Exception as exc:  # noqa: BLE001
@@ -278,8 +353,7 @@ def main() -> int:
             browser.close()
 
     if batch:
-        total_written += write_partitioned_json(batch, partition_root, existing_files)
-        batch.clear()
+        flush_batch()
 
     if not total_collected:
         print("No articles collected", file=sys.stderr)
@@ -288,6 +362,7 @@ def main() -> int:
     print(
         f"Partitioned {total_collected} articles into {total_written} files under {partition_root}"
     )
+    print(f"State saved to {state_path}")
     return 0
 
 
